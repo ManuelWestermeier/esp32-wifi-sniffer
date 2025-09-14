@@ -1,22 +1,16 @@
-/* ESP32 Sniffer + Bluetooth (SPP + BLE NUS) streamer
-   - Streams JSON lines with metadata over Classic BT SPP and BLE UART (NUS)
-   - Accepts simple commands to control the sniffer
-   - Filters: MAC substring filter, min RSSI, type filter, single-channel lock
-*/
+// src/main.cpp - BLE-only, NimBLE NUS + WiFi promiscuous sniffer
+// Removes BluetoothSerial (Classic SPP) to avoid stack/mutex conflicts.
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include "esp_wifi.h"
-#include "BluetoothSerial.h"
+#include "esp_netif.h" // replace deprecated tcpip_adapter_init()
 #include <NimBLEDevice.h>
 
-// ---------- Bluetooth (Classic) ----------
-BluetoothSerial SerialBT;
-
-// ---------- BLE NUS (UART-like) ----------
+// ---------- BLE NUS UUIDs ----------
 #define NUS_SERVICE_UUID "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
-#define NUS_CHAR_RX_UUID "6e400002-b5a3-f393-e0a9-e50e24dcca9e" // write from client
-#define NUS_CHAR_TX_UUID "6e400003-b5a3-f393-e0a9-e50e24dcca9e" // notify to client
+#define NUS_CHAR_RX_UUID "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+#define NUS_CHAR_TX_UUID "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 
 NimBLEServer *pServer = nullptr;
 NimBLECharacteristic *pTxChar = nullptr;
@@ -29,14 +23,16 @@ int channel = 1;
 bool doHop = true;
 unsigned long lastHop = 0;
 const unsigned long hopIntervalMs = 200;
-
 bool sniffing = true;
 
 // filters
-String macFilter = ""; // case-insensitive substring match on src/dst/bssid
+String macFilter = "";
 int minRssi = -1000;
-String typeFilter = ""; // "Mgmt","Ctrl","Data","Beacon" or ""
-int lockChannel = 0;    // 0 = not locked, otherwise 1..13
+String typeFilter = "";
+int lockChannel = 0; // 0 = unlocked
+
+// ---------- BLE RX queue (thread safe) ----------
+static QueueHandle_t bleRxQueue = NULL; // queue of bytes
 
 // ---------- utilities ----------
 String macToStr(const uint8_t *mac)
@@ -47,24 +43,16 @@ String macToStr(const uint8_t *mac)
   return String(buf);
 }
 
-void sendToAll(String s)
+void sendToBLEAndSerial(const String &s)
 {
-  // safe single-line outputs; add newline if missing
-  if (!s.endsWith("\n"))
-    s += "\n";
-  Serial.print(s); // USB serial
-
-  // Classic Bluetooth
-  if (SerialBT.hasClient())
-  {
-    SerialBT.print(s);
-  }
-  // BLE notify (chunk if necessary)
+  String out = s;
+  if (!out.endsWith("\n"))
+    out += "\n";
+  Serial.print(out);
   if (bleClientConnected && pTxChar)
   {
-    // NimBLE handles chunking but we'll do small writes
-    const char *buf = s.c_str();
-    size_t len = s.length();
+    const char *buf = out.c_str();
+    size_t len = out.length();
     size_t pos = 0;
     while (pos < len)
     {
@@ -97,7 +85,6 @@ void sniffer_callback(void *buf, wifi_promiscuous_pkt_type_t type)
   wifi_pkt_rx_ctrl_t rx_ctrl = pkt->rx_ctrl;
   const uint8_t *payload = pkt->payload;
   int len = rx_ctrl.sig_len;
-
   if (payload == nullptr || len <= 0)
     return;
 
@@ -132,7 +119,7 @@ void sniffer_callback(void *buf, wifi_promiscuous_pkt_type_t type)
     String dst = macToStr(hdr.addr1);
     String bssid = macToStr(hdr.addr3);
 
-    // apply filters
+    // filters
     if (minRssi > -999 && rx_ctrl.rssi < minRssi)
       return;
     if (lockChannel && rx_ctrl.channel != lockChannel)
@@ -153,7 +140,6 @@ void sniffer_callback(void *buf, wifi_promiscuous_pkt_type_t type)
         return;
     }
 
-    // build JSON line
     String obj = "{";
     obj += "\"ts\": " + String(millis());
     obj += ", \"chan\": " + String(rx_ctrl.channel);
@@ -165,11 +151,10 @@ void sniffer_callback(void *buf, wifi_promiscuous_pkt_type_t type)
     obj += ", \"dst\": \"" + dst + "\"";
     obj += ", \"bssid\": \"" + bssid + "\"";
     obj += "}";
-    sendToAll(obj);
+    sendToBLEAndSerial(obj);
   }
   else
   {
-    // short payload; still report summary
     String obj = "{";
     obj += "\"ts\": " + String(millis());
     obj += ", \"chan\": " + String(rx_ctrl.channel);
@@ -177,7 +162,7 @@ void sniffer_callback(void *buf, wifi_promiscuous_pkt_type_t type)
     obj += ", \"type\": \"SHORT\"";
     obj += ", \"len\": " + String(len);
     obj += "}";
-    sendToAll(obj);
+    sendToBLEAndSerial(obj);
   }
 }
 
@@ -187,12 +172,12 @@ class ServerCallbacks : public NimBLEServerCallbacks
   void onConnect(NimBLEServer *pServer)
   {
     bleClientConnected = true;
-    sendToAll("[BLE] Client connected");
+    sendToBLEAndSerial("[BLE] Client connected");
   }
   void onDisconnect(NimBLEServer *pServer)
   {
     bleClientConnected = false;
-    sendToAll("[BLE] Client disconnected");
+    sendToBLEAndSerial("[BLE] Client disconnected");
   }
 };
 
@@ -203,60 +188,56 @@ class RxCharCallbacks : public NimBLECharacteristicCallbacks
     std::string v = pCharacteristic->getValue();
     if (v.size())
     {
-      String s((char *)v.c_str());
-      // write callback may receive partial chunks; we accumulate on main loop via a buffer
-      // we'll push into Serial input queue for unified processing
-      Serial.print("[BLE RX CHUNK] ");
-      Serial.println(s);
-      // push to serial buffer (we'll use SerialBT as intermediary if present)
-      if (SerialBT.hasClient())
+      // push bytes safely into a FreeRTOS queue to be processed in loop()
+      for (size_t i = 0; i < v.size(); ++i)
       {
-        SerialBT.print(s.c_str());
+        char c = v[i];
+        // non-blocking enqueue; drop if full
+        if (bleRxQueue)
+          xQueueSend(bleRxQueue, &c, 0);
       }
-      // also feed USB Serial so monitor can see
-      Serial.print(s.c_str());
     }
   }
 };
 
-// ---------- command handling (from Serial, SerialBT, or BLE RX) ----------
+// ---------- command handling ----------
 String inputBuffer = "";
+
 void handleLine(String line)
 {
   line.trim();
   if (line.length() == 0)
     return;
-  sendToAll(String("[ACK] ") + line); // echo ack
-  // parse simple commands
+  sendToBLEAndSerial(String("[ACK] ") + line);
+
   if (line.equalsIgnoreCase("START"))
   {
     sniffing = true;
-    sendToAll("[INFO] Sniffer STARTED");
+    sendToBLEAndSerial("[INFO] Sniffer STARTED");
   }
   else if (line.equalsIgnoreCase("STOP"))
   {
     sniffing = false;
-    sendToAll("[INFO] Sniffer STOPPED");
+    sendToBLEAndSerial("[INFO] Sniffer STOPPED");
   }
   else if (line.equalsIgnoreCase("HOP TOGGLE") || line.equalsIgnoreCase("HOP"))
   {
     doHop = !doHop;
-    sendToAll(String("[INFO] Channel hopping ") + (doHop ? "ENABLED" : "DISABLED"));
+    sendToBLEAndSerial(String("[INFO] Channel hopping ") + (doHop ? "ENABLED" : "DISABLED"));
   }
   else if (line.equalsIgnoreCase("HOP ON"))
   {
     doHop = true;
-    sendToAll("[INFO] Channel hopping ENABLED");
+    sendToBLEAndSerial("[INFO] Channel hopping ENABLED");
   }
   else if (line.equalsIgnoreCase("HOP OFF"))
   {
     doHop = false;
-    sendToAll("[INFO] Channel hopping DISABLED");
+    sendToBLEAndSerial("[INFO] Channel hopping DISABLED");
   }
   else if (line.startsWith("SET_CH"))
   {
     int n = -1;
-    // allow "SET_CH N" or "SET_CH:N"
     int sp = line.indexOf(' ');
     if (sp > 0)
       n = line.substring(sp + 1).toInt();
@@ -270,10 +251,10 @@ void handleLine(String line)
     {
       channel = n;
       esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
-      sendToAll(String("[INFO] Channel set to ") + String(channel));
+      sendToBLEAndSerial(String("[INFO] Channel set to ") + String(channel));
     }
     else
-      sendToAll("[ERR] SET_CH requires 1..13");
+      sendToBLEAndSerial("[ERR] SET_CH requires 1..13");
   }
   else if (line.startsWith("FILTER ADD"))
   {
@@ -283,36 +264,35 @@ void handleLine(String line)
     if (mac.length())
     {
       macFilter = mac;
-      sendToAll(String("[INFO] MAC filter set to ") + macFilter);
+      sendToBLEAndSerial(String("[INFO] MAC filter set to ") + macFilter);
     }
     else
-      sendToAll("[ERR] FILTER ADD <mac-substring>");
+      sendToBLEAndSerial("[ERR] FILTER ADD <mac-substring>");
   }
   else if (line.startsWith("FILTER CLR") || line.startsWith("FILTER CLEAR") || line.equalsIgnoreCase("FILTER CLR"))
   {
     macFilter = "";
     minRssi = -1000;
     typeFilter = "";
-    sendToAll("[INFO] Filters cleared");
+    sendToBLEAndSerial("[INFO] Filters cleared");
   }
   else if (line.startsWith("RSSI_MIN"))
   {
-    // RSSI_MIN -60
     int sp2 = line.indexOf(' ');
     if (sp2 > 0)
     {
       int r = line.substring(sp2 + 1).toInt();
       minRssi = r;
-      sendToAll(String("[INFO] minRssi=") + String(minRssi));
+      sendToBLEAndSerial(String("[INFO] minRssi=") + String(minRssi));
     }
     else
-      sendToAll("[ERR] RSSI_MIN <value>");
+      sendToBLEAndSerial("[ERR] RSSI_MIN <value>");
   }
   else if (line.startsWith("TYPE "))
   {
     String t = line.substring(5);
     typeFilter = t;
-    sendToAll(String("[INFO] Type filter set to ") + typeFilter);
+    sendToBLEAndSerial(String("[INFO] Type filter set to ") + typeFilter);
   }
   else if (line.equalsIgnoreCase("GET_STATUS"))
   {
@@ -323,20 +303,20 @@ void handleLine(String line)
     s += ", macFilter=" + macFilter;
     s += ", minRssi=" + String(minRssi);
     s += ", typeFilter=" + typeFilter;
-    sendToAll(s);
+    sendToBLEAndSerial(s);
   }
   else
   {
-    sendToAll(String("[WARN] Unknown command: ") + line);
+    sendToBLEAndSerial(String("[WARN] Unknown command: ") + line);
   }
 }
 
 void processIncomingFromSerials()
 {
-  // read from USB Serial
+  // USB Serial first
   while (Serial.available())
   {
-    char c = Serial.read();
+    char c = (char)Serial.read();
     if (c == '\n' || c == '\r')
     {
       if (inputBuffer.length())
@@ -346,16 +326,14 @@ void processIncomingFromSerials()
       }
     }
     else
-    {
       inputBuffer += c;
-    }
   }
-  // read from Classic BT
-  if (SerialBT.hasClient())
+  // BLE RX queue -> append to inputBuffer
+  if (bleRxQueue)
   {
-    while (SerialBT.available())
+    char c;
+    while (xQueueReceive(bleRxQueue, &c, 0) == pdTRUE)
     {
-      char c = SerialBT.read();
       if (c == '\n' || c == '\r')
       {
         if (inputBuffer.length())
@@ -366,9 +344,11 @@ void processIncomingFromSerials()
       }
       else
         inputBuffer += c;
+      // prevent runaway long buffers
+      if (inputBuffer.length() > 512)
+        inputBuffer = inputBuffer.substring(inputBuffer.length() - 512);
     }
   }
-  // Note: BLE RX writes are forwarded into Serial and SerialBT in RxCharCallbacks
 }
 
 // ---------- setup ----------
@@ -377,17 +357,14 @@ void setup()
   Serial.begin(115200);
   delay(100);
 
-  // Classic Bluetooth SPP
-  if (!SerialBT.begin("ESP32-Sniffer"))
+  // Create BLE RX queue (512 bytes)
+  bleRxQueue = xQueueCreate(512, sizeof(char));
+  if (!bleRxQueue)
   {
-    Serial.println("SerialBT begin failed");
-  }
-  else
-  {
-    Serial.println("SerialBT started - pair from PC/Android");
+    Serial.println("[ERR] bleRxQueue creation failed");
   }
 
-  // BLE NUS
+  // NimBLE BLE NUS server
   NimBLEDevice::init("ESP32-NUS");
   pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new ServerCallbacks());
@@ -401,31 +378,33 @@ void setup()
   pAdv->start();
   Serial.println("BLE NUS started");
 
+  // Network init (replace deprecated tcpip_adapter_init)
+  esp_netif_init();
+
   // WiFi driver init for promiscuous
   WiFi.mode(WIFI_MODE_NULL);
   esp_wifi_stop();
-  tcpip_adapter_init();
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   esp_err_t err = esp_wifi_init(&cfg);
   if (err != ESP_OK)
   {
-    sendToAll(String("[ERR] esp_wifi_init failed: ") + String((int)err));
+    sendToBLEAndSerial(String("[ERR] esp_wifi_init failed: ") + String((int)err));
     while (true)
       delay(1000);
   }
   err = esp_wifi_set_mode(WIFI_MODE_STA);
   if (err != ESP_OK)
-    sendToAll(String("[ERR] esp_wifi_set_mode failed: ") + String((int)err));
+    sendToBLEAndSerial(String("[ERR] esp_wifi_set_mode failed: ") + String((int)err));
   err = esp_wifi_start();
   if (err != ESP_OK)
-    sendToAll(String("[ERR] esp_wifi_start failed: ") + String((int)err));
+    sendToBLEAndSerial(String("[ERR] esp_wifi_start failed: ") + String((int)err));
 
-  // set promisc callback
+  // promiscuous callback
   esp_wifi_set_promiscuous_rx_cb(&sniffer_callback);
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
 
-  sendToAll("[INFO] ESP32 sniffer started. Use Bluetooth serial (SPP) or BLE to connect. Channel hopping enabled by default.");
+  sendToBLEAndSerial("[INFO] ESP32 sniffer started (BLE-only). Channel hopping enabled by default.");
 }
 
 // ---------- loop ----------
