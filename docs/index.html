@@ -1,80 +1,304 @@
-<!DOCTYPE html>
+<!doctype html>
 <html>
-  <head>
-    <meta charset="utf-8" />
-    <title>ESP32 Serial Terminal</title>
-    <style>
-      body {
-        font-family: monospace;
-        background: #111;
-        color: #0f0;
-      }
-      #log {
-        width: 100%;
-        height: 300px;
-        background: #000;
-        color: #0f0;
-      }
-      button,
-      input {
-        margin: 5px;
-        padding: 5px;
-      }
-    </style>
-  </head>
-  <body>
-    <h1>ESP32 Serial Terminal</h1>
-    <button id="connect">Connect</button>
-    <input id="input" placeholder="Type command..." />
-    <button id="send">Send</button>
-    <br />
-    <textarea id="log" readonly></textarea>
+<head>
+<meta charset="utf-8" />
+<title>ESP32 Sniffer Console</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  :root{
+    --bg:#0f1720;
+    --card:#0b1220;
+    --accent:#00d084;
+    --muted:#94a3b8;
+    --danger:#ff6b6b;
+    --glass: rgba(255,255,255,0.03);
+  }
+  html,body{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;}
+  body{background:linear-gradient(180deg,#071018 0%, #071a1f 60%); color:#e6eef6; padding:18px; box-sizing:border-box;}
+  header{display:flex;gap:16px;align-items:center;margin-bottom:18px;}
+  h1{font-size:20px;margin:0}
+  .controls{display:flex;gap:8px;align-items:center; margin-left:auto;}
+  button{background:var(--glass);border:1px solid rgba(255,255,255,0.04); color:var(--accent); padding:8px 12px;border-radius:10px; cursor:pointer;}
+  button.primary{background:linear-gradient(90deg,#042f2a,#004d3e); color:#fff; border:0;}
+  .card{background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01)); border-radius:12px; padding:12px; box-shadow: 0 6px 24px rgba(2,6,23,0.6); border:1px solid rgba(255,255,255,0.03);}
+  main{display:grid;grid-template-columns: 380px 1fr; gap:12px; height: calc(100vh - 110px);}
+  .left{display:flex;flex-direction:column;gap:12px;}
+  .status{padding:10px;border-radius:8px;background:rgba(0,0,0,0.25);color:var(--muted);font-size:13px;}
+  .filters{display:flex;flex-direction:column;gap:8px;}
+  label{font-size:12px;color:var(--muted)}
+  input,select{padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.04);background:#08131a;color:#e6eef6;}
+  #packetList{height:100%; overflow:auto; font-family: monospace; font-size:12px; padding:8px; border-radius:8px; background:#041018;}
+  .pkt{padding:6px;border-bottom:1px dashed rgba(255,255,255,0.02);}
+  .pkt .meta{color:var(--muted); font-size:11px;}
+  .topbar{display:flex;gap:8px;align-items:center;}
+  .toasts{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;}
+  .toast{padding:10px 14px;border-radius:10px;background:rgba(0,0,0,0.6);border:1px solid rgba(255,255,255,0.03); color:#e6eef6;}
+  .error{border-left:4px solid var(--danger)}
+  .ok{border-left:4px solid var(--accent)}
+  .sendRow{display:flex;gap:8px;margin-top:8px;}
+  textarea#log{width:100%;height:160px;border-radius:8px;padding:8px;background:#02060a;color:#8ff6b3;border:1px solid rgba(255,255,255,0.02);resize:vertical;font-family:monospace;}
+  table{width:100%;border-collapse:collapse}
+  th,td{padding:8px;text-align:left;border-bottom:1px solid rgba(255,255,255,0.03);font-size:13px}
+</style>
+</head>
+<body>
+  <header>
+    <h1>ESP32 Sniffer Console</h1>
+    <div class="controls">
+      <button id="connectSerial">Connect USB Serial</button>
+      <button id="connectBLE" class="primary">Connect BLE</button>
+      <button id="connectBT">Connect Classic BT (Android/PC)</button>
+    </div>
+  </header>
 
-    <script>
-      let port, writer, reader;
+  <main>
+    <div class="left card">
+      <div class="status" id="status">Idle — not connected</div>
 
-      async function connect() {
-        try {
-          port = await navigator.serial.requestPort();
-          await port.open({ baudRate: 115200 });
+      <div class="card filters">
+        <label>Frame type</label>
+        <select id="ftype">
+          <option value="">All</option>
+          <option value="Mgmt">Mgmt</option>
+          <option value="Ctrl">Ctrl</option>
+          <option value="Data">Data</option>
+          <option value="Beacon">Beacon</option>
+        </select>
 
-          // Set up writer
-          writer = port.writable.getWriter();
+        <label>MAC filter (contains)</label>
+        <input id="macFilter" placeholder="e.g. 12:34 or A4:5E" />
 
-          // Set up reader
-          const decoder = new TextDecoderStream();
-          port.readable.pipeTo(decoder.writable);
-          reader = decoder.readable.getReader();
+        <label>Min RSSI (dBm)</label>
+        <input id="rssiFilter" type="number" placeholder="-120" />
 
-          // Read loop
-          readLoop();
-        } catch (err) {
-          alert("Connection failed: " + err);
+        <label>Channel</label>
+        <input id="channelFilter" type="number" min="1" max="13" placeholder="(all)" />
+
+        <div style="display:flex;gap:8px;">
+          <button id="applyFilters">Apply</button>
+          <button id="clearFilters">Clear</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div style="display:flex;gap:8px;align-items:center;justify-content:space-between;">
+          <div>
+            <button id="cmdStart">Start</button>
+            <button id="cmdStop">Stop</button>
+          </div>
+          <div>
+            <button id="cmdHop">Toggle Hop</button>
+            <button id="cmdStatus">Status</button>
+          </div>
+        </div>
+
+        <div style="margin-top:8px;">
+          <label>Manual command</label>
+          <div class="sendRow">
+            <input id="manualCmd" placeholder="e.g. SET_CH 6" />
+            <button id="sendCmd">Send</button>
+          </div>
+          <small style="color:var(--muted)">Commands: START, STOP, HOP ON|OFF, SET_CH N, FILTER ADD <mac>, FILTER CLR, GET_STATUS</small>
+        </div>
+      </div>
+
+      <div class="card" style="flex:1;min-height:160px;">
+        <label>Raw log</label>
+        <textarea id="log" readonly></textarea>
+      </div>
+    </div>
+
+    <div class="card" style="display:flex;flex-direction:column;">
+      <div class="topbar" style="justify-content:space-between">
+        <div><strong>Packets</strong></div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <label style="font-size:12px;color:var(--muted)">Auto-scroll</label>
+          <input id="autoscroll" type="checkbox" checked />
+          <label style="font-size:12px;color:var(--muted)">JSON output</label>
+          <input id="jsonOut" type="checkbox" />
+        </div>
+      </div>
+      <div id="packetList" style="margin-top:8px;"></div>
+    </div>
+  </main>
+
+  <div class="toasts" id="toasts"></div>
+
+<script>
+/* ---- helpers ---- */
+const toastArea = document.getElementById('toasts');
+function toast(msg, kind='ok', ttl=4500){ const el = document.createElement('div'); el.className='toast '+(kind==='error'?'error':'ok'); el.textContent=msg; toastArea.appendChild(el); setTimeout(()=>el.remove(), ttl); }
+function logRaw(s){ const ta=document.getElementById('log'); ta.value += s + '\\n'; ta.scrollTop=ta.scrollHeight; }
+
+/* ---- connection backends: Web Serial + Web Bluetooth (NUS) + Classic BT fallback ---- */
+let serialPort = null, serialWriter=null, serialReader=null;
+let bleDevice=null, bleServer=null, bleTxChar=null, bleRxChar=null; // TX: device->client (notify), RX: client->device (write)
+let btSocket=null; // classic not implementable in web — leave button to instruct user to use native apps
+const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const NUS_RX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+const NUS_TX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+
+async function connectSerial(){
+  try{
+    serialPort = await navigator.serial.requestPort();
+    await serialPort.open({ baudRate: 115200 });
+    toast('Serial connected');
+    document.getElementById('status').textContent='Connected (USB Serial)';
+    serialWriter = serialPort.writable.getWriter();
+    const decoder = new TextDecoderStream();
+    serialPort.readable.pipeTo(decoder.writable);
+    serialReader = decoder.readable.getReader();
+    readLoop(serialReader);
+  }catch(e){ toast('Serial connect failed: ' + e, 'error'); }
+}
+
+async function connectBLE(){
+  try{
+    const dev = await navigator.bluetooth.requestDevice({ filters: [{ services: [NUS_SERVICE] }], optionalServices: [NUS_SERVICE] });
+    bleDevice = dev;
+    bleServer = await dev.gatt.connect();
+    const svc = await bleServer.getPrimaryService(NUS_SERVICE);
+    bleTxChar = await svc.getCharacteristic(NUS_TX); // notifications
+    bleRxChar = await svc.getCharacteristic(NUS_RX); // write
+    await bleTxChar.startNotifications();
+    bleTxChar.addEventListener('characteristicvaluechanged', e => {
+      const v = new TextDecoder().decode(e.target.value);
+      receiveLine(v);
+    });
+    toast('BLE connected to ' + dev.name);
+    document.getElementById('status').textContent='Connected (BLE: ' + (dev.name||'ESP32') + ')';
+  }catch(e){ toast('BLE connect failed: '+e, 'error'); }
+}
+
+document.getElementById('connectSerial').onclick = connectSerial;
+document.getElementById('connectBLE').onclick = connectBLE;
+document.getElementById('connectBT').onclick = ()=>{ toast('Classic Bluetooth: use "Serial Bluetooth Terminal" on Android or a native SPP client on PC. Web cannot open Classic RFCOMM.','error',7000); };
+
+/* ---- reading loop for serial ---- */
+async function readLoop(reader){
+  try{
+    while(true){
+      const {value,done} = await reader.read();
+      if(done) break;
+      if(value) receiveLine(value);
+    }
+  }catch(e){ toast('Serial read error: '+e,'error'); }
+}
+
+/* ---- generic receive -> lines processed ---- */
+let recvBuffer='';
+function receiveLine(chunk){
+  // chunk may contain partial lines
+  recvBuffer += chunk;
+  const lines = recvBuffer.split(/\\r?\\n/);
+  recvBuffer = lines.pop();
+  for(const ln of lines){
+    if(!ln) continue;
+    try{
+      // if JSON, parse and render nicely
+      if(document.getElementById('jsonOut').checked){
+        try{
+          const j = JSON.parse(ln);
+          addPacket(j);
+          logRaw(ln);
+        }catch(e){
+          logRaw('RAW: '+ln);
         }
+      } else {
+        logRaw(ln);
+        // try parse json for packetList
+        try{ const j=JSON.parse(ln); addPacket(j); }catch(e){}
       }
+    }catch(e){ logRaw('err:'+e); }
+  }
+}
 
-      async function readLoop() {
-        const log = document.getElementById("log");
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          if (value) {
-            log.value += value;
-            log.scrollTop = log.scrollHeight;
-          }
-        }
-      }
+/* ---- send command to whichever connected backend ---- */
+async function sendToDevice(text){
+  if(serialWriter){
+    await serialWriter.write(new TextEncoder().encode(text + '\\n'));
+    return true;
+  } else if(bleRxChar){
+    const enc = new TextEncoder().encode(text + '\\n');
+    // split into 20-byte chunks
+    let i=0;
+    while(i < enc.length){
+      const chunk = enc.slice(i, i+20);
+      await bleRxChar.writeValue(chunk);
+      i += 20;
+    }
+    return true;
+  } else {
+    toast('Not connected to any device','error');
+    return false;
+  }
+}
 
-      async function send() {
-        const input = document.getElementById("input");
-        if (!writer) return;
-        const data = input.value + "\n";
-        await writer.write(new TextEncoder().encode(data));
-        input.value = "";
-      }
+document.getElementById('sendCmd').onclick = async ()=>{
+  const v = document.getElementById('manualCmd').value.trim();
+  if(!v) return;
+  await sendToDevice(v);
+  document.getElementById('manualCmd').value='';
+  toast('Sent: '+v);
+};
+document.getElementById('cmdStart').onclick = ()=> sendToDevice('START');
+document.getElementById('cmdStop').onclick = ()=> sendToDevice('STOP');
+document.getElementById('cmdHop').onclick = ()=> sendToDevice('HOP TOGGLE');
+document.getElementById('cmdStatus').onclick = ()=> sendToDevice('GET_STATUS');
 
-      document.getElementById("connect").addEventListener("click", connect);
-      document.getElementById("send").addEventListener("click", send);
-    </script>
-  </body>
+/* ---- packet handling + filters ---- */
+const rows = [];
+function addPacket(pkt){
+  // pkt expected as object {ts,chan,rssi,type,subtype,src,dst,bssid}
+  const ftype = document.getElementById('ftype').value;
+  const macf = document.getElementById('macFilter').value.trim().toLowerCase();
+  const rssiMin = parseInt(document.getElementById('rssiFilter').value || '-999');
+  const chFilter = parseInt(document.getElementById('channelFilter').value || '0');
+
+  if(ftype && !(pkt.type==ftype || pkt.subtype==ftype)) return;
+  if(macf && !(pkt.src.toLowerCase().includes(macf) || pkt.dst.toLowerCase().includes(macf) || pkt.bssid.toLowerCase().includes(macf))) return;
+  if(pkt.rssi < rssiMin) return;
+  if(chFilter && pkt.chan !== chFilter) return;
+
+  rows.unshift(pkt);
+  if(rows.length>1000) rows.pop();
+  renderList();
+}
+
+function renderList(){
+  const el=document.getElementById('packetList'); el.innerHTML='';
+  for(const p of rows){
+    const div=document.createElement('div'); div.className='pkt';
+    const meta = `${p.ts} ms  CH:${String(p.chan).padStart(2,' ')}  RSSI:${p.rssi} dBm  ${p.type}${p.subtype?('/'+p.subtype):''}`;
+    div.innerHTML = `<div style="font-weight:600">${p.src} → ${p.dst} <span style="float:right;color:var(--muted)">${p.bssid}</span></div>
+                     <div class="meta">${meta}</div>
+                     <div style="color:var(--muted);font-size:12px">${p.info||''}</div>`;
+    el.appendChild(div);
+  }
+  if(document.getElementById('autoscroll').checked) el.scrollTop = 0;
+}
+
+/* ---- filter buttons ---- */
+document.getElementById('applyFilters').onclick = renderList;
+document.getElementById('clearFilters').onclick = ()=>{
+  document.getElementById('ftype').value='';
+  document.getElementById('macFilter').value='';
+  document.getElementById('rssiFilter').value='';
+  document.getElementById('channelFilter').value='';
+  renderList();
+  toast('Filters cleared');
+};
+
+/* ---- friendly errors / device support display ---- */
+function showSupportMessage(){
+  toast('If you get a connection error: try toggling the device and ensure the ESP32 has Bluetooth enabled.', 'ok', 5000);
+}
+showSupportMessage();
+
+/* ---- graceful unload ----- */
+window.addEventListener('beforeunload', async ()=> {
+  try{ if(serialWriter) await serialWriter.releaseLock(); if(serialReader) await serialReader.releaseLock(); if(serialPort) await serialPort.close(); }catch(e){}
+});
+</script>
+</body>
 </html>
